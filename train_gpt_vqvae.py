@@ -62,6 +62,7 @@ class Hyperparameters:
 
     # Decoder
     dec_layers = int(os.environ.get("DEC_LAYERS", 6))
+    dec_loops = int(os.environ.get("DEC_LOOPS", 1))
     dec_heads = int(os.environ.get("DEC_HEADS", 8))
     dec_kv_heads = int(os.environ.get("DEC_KV_HEADS", 4))
     dec_mlp_mult = int(os.environ.get("DEC_MLP_MULT", 3))
@@ -107,9 +108,11 @@ class Hyperparameters:
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 0))
+    use_prior_context = bool(int(os.environ.get("USE_PRIOR_CONTEXT", "1")))
 
 CONTROL_NAMES = ("skip_weights", "attn_scale", "mlp_scale", "resid_mix", "q_gain",
-                 "enc_pos", "prior_start")
+                 "enc_pos", "prior_start", "lora", "loop_emb")
 
 # ---------------------------------------------------------------------------
 # MUON OPTIMIZER
@@ -356,7 +359,7 @@ class PriorBlock(nn.Module):
 
 class DecoderAttention(nn.Module):
     def __init__(self, dim: int, n_heads: int, n_kv_heads: int,
-                 rope_base: float, qk_gain_init: float = 1.5):
+                 rope_base: float, qk_gain_init: float = 1.5, lora_rank: int = 0):
         super().__init__()
         self.n_heads = n_heads
         self.n_kv = n_kv_heads
@@ -369,12 +372,24 @@ class DecoderAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((n_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.hd, rope_base)
+        self.lora_rank = lora_rank
+        if lora_rank > 0:
+            self.lora_q_A = nn.Parameter(torch.zeros(lora_rank, dim))
+            self.lora_q_B = nn.Parameter(torch.zeros(dim, lora_rank))
+            self.lora_v_A = nn.Parameter(torch.zeros(lora_rank, dim))
+            self.lora_v_B = nn.Parameter(torch.zeros(kv_dim, lora_rank))
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
-        q = self.c_q(x).reshape(B, T, self.n_heads, self.hd).transpose(1, 2)
-        k = self.c_k(x).reshape(B, T, self.n_kv, self.hd).transpose(1, 2)
-        v = self.c_v(x).reshape(B, T, self.n_kv, self.hd).transpose(1, 2)
+        q = self.c_q(x)
+        k = self.c_k(x)
+        v = self.c_v(x)
+        if self.lora_rank > 0:
+            q = q + F.linear(F.linear(x, self.lora_q_A), self.lora_q_B)
+            v = v + F.linear(F.linear(x, self.lora_v_A), self.lora_v_B)
+        q = q.reshape(B, T, self.n_heads, self.hd).transpose(1, 2)
+        k = k.reshape(B, T, self.n_kv, self.hd).transpose(1, 2)
+        v = v.reshape(B, T, self.n_kv, self.hd).transpose(1, 2)
         q, k = F.rms_norm(q, (self.hd,)), F.rms_norm(k, (self.hd,))
         cos, sin = self.rotary(T, x.device, q.dtype)
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
@@ -386,11 +401,12 @@ class DecoderAttention(nn.Module):
 
 class DecoderBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int, n_kv_heads: int,
-                 mlp_mult: int, rope_base: float, qk_gain_init: float):
+                 mlp_mult: int, rope_base: float, qk_gain_init: float,
+                 lora_rank: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = DecoderAttention(dim, n_heads, n_kv_heads, rope_base, qk_gain_init)
+        self.attn = DecoderAttention(dim, n_heads, n_kv_heads, rope_base, qk_gain_init, lora_rank)
         hidden = dim * mlp_mult
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.mlp_proj = CastedLinear(hidden, dim, bias=False)
@@ -448,17 +464,24 @@ class SegmentBottleneckVAE(nn.Module):
         nn.init.zeros_(self.logvar_prior_proj.weight)
 
         # --- Decoder ---
-        self.z_to_mem = CastedLinear(args.latent_dim, args.n_mem_tokens * D, bias=False)
-        n_enc = args.dec_layers // 2
-        n_dec = args.dec_layers - n_enc
-        self.n_enc_layers = n_enc
-        self.n_dec_layers = n_dec
-        self.n_skip = min(n_enc, n_dec)
-        self.skip_weights = nn.Parameter(torch.ones(self.n_skip, D, dtype=torch.float32))
+        self.use_prior_context = args.use_prior_context
+        cond_dim = args.latent_dim + args.prior_dim if args.use_prior_context else args.latent_dim
+        self.z_to_mem = CastedLinear(cond_dim, args.n_mem_tokens * D, bias=False)
+        self.dec_loops = args.dec_loops
         self.dec_blocks = nn.ModuleList([
             DecoderBlock(D, args.dec_heads, args.dec_kv_heads,
-                         args.dec_mlp_mult, args.rope_base, args.qk_gain_init)
+                         args.dec_mlp_mult, args.rope_base, args.qk_gain_init,
+                         args.ttt_lora_rank)
             for _ in range(args.dec_layers)])
+        if args.dec_loops > 1:
+            self.loop_emb = nn.Parameter(torch.zeros(args.dec_loops, D))
+        else:
+            n_enc = args.dec_layers // 2
+            n_dec = args.dec_layers - n_enc
+            self.n_enc_layers = n_enc
+            self.n_dec_layers = n_dec
+            self.n_skip = min(n_enc, n_dec)
+            self.skip_weights = nn.Parameter(torch.ones(self.n_skip, D, dtype=torch.float32))
         self.final_norm = RMSNorm()
 
         # Zero-init residual projections
@@ -478,7 +501,7 @@ class SegmentBottleneckVAE(nn.Module):
         return (self.mu_proj(pooled).reshape(B, N, -1),
                 self.logvar_proj(pooled).reshape(B, N, -1))
 
-    def prior_forward(self, z: Tensor) -> tuple[Tensor, Tensor]:
+    def prior_forward(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         B, N, _ = z.shape
         h = self.prior_in(z)
         start = self.prior_start.expand(B, 1, -1).to(h.dtype)
@@ -486,28 +509,34 @@ class SegmentBottleneckVAE(nn.Module):
         for blk in self.prior_blocks:
             h = blk(h)
         h = self.prior_norm(h[:, :N])
-        return self.mu_prior_proj(h), self.logvar_prior_proj(h)
+        return self.mu_prior_proj(h), self.logvar_prior_proj(h), h
 
-    def decode(self, z: Tensor, tok_embs: Tensor, seg_tokens: Tensor) -> Tensor:
+    def decode(self, cond: Tensor, tok_embs: Tensor, seg_tokens: Tensor) -> Tensor:
         B, T, D = tok_embs.shape
         S = self.segment_size
         N = T // S
 
-        mem = self.z_to_mem(z).reshape(B * N, self.n_mem, D)
+        mem = self.z_to_mem(cond).reshape(B * N, self.n_mem, D)
         seg_embs = tok_embs[:, :N * S].reshape(B, N, S, D)
         dec_tok = seg_embs[:, :, :-1].reshape(B * N, S - 1, D)
         x = torch.cat([mem, dec_tok], dim=1)
         x = F.rms_norm(x, (D,))
         x0 = x
 
-        skips: list[Tensor] = []
-        for i in range(self.n_enc_layers):
-            x = self.dec_blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.n_dec_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(x.dtype)[None, None] * skips.pop()
-            x = self.dec_blocks[self.n_enc_layers + i](x, x0)
+        if self.dec_loops > 1:
+            for loop_idx in range(self.dec_loops):
+                x = x + self.loop_emb[loop_idx].to(x.dtype)[None, None]
+                for blk in self.dec_blocks:
+                    x = blk(x, x0)
+        else:
+            skips: list[Tensor] = []
+            for i in range(self.n_enc_layers):
+                x = self.dec_blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.n_dec_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(x.dtype)[None, None] * skips.pop()
+                x = self.dec_blocks[self.n_enc_layers + i](x, x0)
 
         h = self.final_norm(x)[:, self.n_mem - 1 :, :]
         logits = F.linear(h, self.tok_emb.weight)
@@ -528,8 +557,12 @@ class SegmentBottleneckVAE(nn.Module):
         mu, logvar = self.encode(tok_embs)
         z = mu + torch.exp(0.5 * logvar) * torch.randn_like(logvar)
 
-        mu_p, logvar_p = self.prior_forward(z.detach())
-        recon_loss = self.decode(z, tok_embs, seg_tokens)
+        mu_p, logvar_p, prior_ctx = self.prior_forward(z.detach())
+        if self.use_prior_context:
+            dec_cond = torch.cat([z, prior_ctx], dim=-1)
+        else:
+            dec_cond = z
+        recon_loss = self.decode(dec_cond, tok_embs, seg_tokens)
 
         var_q = logvar.exp()
         var_p = logvar_p.exp().clamp_min(1e-8)
@@ -667,10 +700,24 @@ def eval_val_ttt(
     chunk_seqs = max(1, args.ttt_chunk_tokens // seq_len)
     num_chunks = (total_seqs + chunk_seqs - 1) // chunk_seqs
 
-    ttt_params = [p for p in raw_model.parameters()]
-    for p in ttt_params:
-        p.requires_grad_(True)
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    has_lora = any("lora" in n for n, _ in raw_model.named_parameters())
+    if has_lora:
+        for n, p in raw_model.named_parameters():
+            if "lora" in n:
+                if "_A" in n:
+                    nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                else:
+                    nn.init.zeros_(p)
+                p.requires_grad_(True)
+            else:
+                p.requires_grad_(False)
+        ttt_params = [p for n, p in raw_model.named_parameters() if "lora" in n]
+        optimizer = torch.optim.Adam(ttt_params, lr=args.ttt_lr)
+    else:
+        ttt_params = [p for p in raw_model.parameters()]
+        for p in ttt_params:
+            p.requires_grad_(True)
+        optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
 
     total_recon = 0.0
     total_kl = 0.0
@@ -771,8 +818,9 @@ def main() -> None:
     log("Segment-Bottleneck VAE LM")
     log(f"  encoder: {args.enc_layers}L dim={args.enc_dim} heads={args.enc_heads}")
     log(f"  prior:   {args.prior_layers}L dim={args.prior_dim} heads={args.prior_heads}")
-    log(f"  decoder: {args.dec_layers}L dim={args.model_dim} "
-        f"heads={args.dec_heads}/{args.dec_kv_heads} mlp={args.dec_mlp_mult}x")
+    log(f"  decoder: {args.dec_layers}L×{args.dec_loops} dim={args.model_dim} "
+        f"heads={args.dec_heads}/{args.dec_kv_heads} mlp={args.dec_mlp_mult}x"
+        f" lora_r={args.ttt_lora_rank}")
     log(f"  vae: seg={args.segment_size} latent={args.latent_dim} "
         f"mem={args.n_mem_tokens} segs/seq={n_segs}")
     log(f"  kl: weight={args.kl_weight} free_bits={args.free_bits} "
@@ -801,6 +849,12 @@ def main() -> None:
     n_params = sum(p.numel() for p in raw_model.parameters())
     log(f"  params: {n_params:,}")
 
+    try:
+        import torch._inductor.config as ind_cfg
+        ind_cfg.triton.persistent_reductions = False
+    except Exception:
+        pass
+
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
     model = torch.compile(raw_model, dynamic=False)
 
@@ -811,6 +865,8 @@ def main() -> None:
 
     for name, p in raw_model.named_parameters():
         if p is raw_model.tok_emb.weight:
+            continue
+        if "lora" in name:
             continue
         if p.ndim == 2 and p.numel() > 256 and not any(cn in name for cn in CONTROL_NAMES):
             matrix_params.append(p)

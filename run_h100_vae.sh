@@ -13,9 +13,10 @@ export TOKENIZER_PATH="./data/tokenizers/fineweb_1024_bpe.model"
 export SEED=1337
 export VOCAB_SIZE=1024
 
-# Decoder
+# Decoder (2 unique layers × 4 loops = 8 effective depth)
 export MODEL_DIM=768
-export DEC_LAYERS=7
+export DEC_LAYERS=2
+export DEC_LOOPS=4
 export DEC_HEADS=12
 export DEC_KV_HEADS=6
 export DEC_MLP_MULT=3
@@ -29,7 +30,7 @@ export ENC_HEADS=6
 
 # Prior (causal over z)
 export PRIOR_DIM=384
-export PRIOR_LAYERS=4
+export PRIOR_LAYERS=3
 export PRIOR_HEADS=6
 
 # VAE
@@ -43,10 +44,10 @@ export KL_WARMUP_STEPS=2000
 # Training
 export TRAIN_SEQ_LEN=1024
 export TRAIN_BATCH_TOKENS=65536
-export ITERATIONS=25000
-export WARMDOWN_ITERS=4000
+export ITERATIONS=20000
+export WARMDOWN_ITERS=3000
 export WARMUP_STEPS=200
-export MAX_WALLCLOCK_SECONDS=5400
+export MAX_WALLCLOCK_SECONDS=4800
 
 # Optimizer
 export EMBED_LR=0.05
@@ -59,13 +60,14 @@ export GRAD_CLIP_NORM=1.0
 # EMA
 export EMA_DECAY=0.997
 
-# TTT
+# TTT (LoRA-based)
 export TTT_ENABLED=1
 export TTT_LR=0.002
 export TTT_EPOCHS=3
 export TTT_CHUNK_TOKENS=32768
 export TTT_MOMENTUM=0.9
 export TTT_GRAD_CLIP=1.0
+export TTT_LORA_RANK=4
 
 # Logging
 export VAL_LOSS_EVERY=500
