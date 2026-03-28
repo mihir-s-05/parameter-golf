@@ -93,6 +93,7 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.05))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    latent_lr = float(os.environ.get("LATENT_LR", 0.01))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -113,9 +114,22 @@ class Hyperparameters:
 
     # QAT (quantization-aware training)
     qat_fraction = float(os.environ.get("QAT_FRACTION", "0.65"))
+    latent_std_floor = float(os.environ.get("LATENT_STD_FLOOR", "1e-4"))
+    latent_raw_std_clip = float(os.environ.get("LATENT_RAW_STD_CLIP", "8.0"))
 
 CONTROL_NAMES = ("skip_weights", "attn_scale", "mlp_scale", "resid_mix", "q_gain",
                  "enc_pos", "prior_start", "lora", "loop_emb")
+LATENT_NAMES = (
+    "enc_down",
+    "enc_pos",
+    "mu_proj",
+    "logvar_proj",
+    "prior_in",
+    "prior_start",
+    "mu_prior_proj",
+    "logvar_prior_proj",
+    "z_to_mem",
+)
 
 # ---------------------------------------------------------------------------
 # MUON OPTIMIZER
@@ -460,6 +474,8 @@ class SegmentBottleneckVAE(nn.Module):
         self.n_mem = args.n_mem_tokens
         self.vocab_size = args.vocab_size
         self.logit_softcap = args.logit_softcap
+        self.latent_std_floor = args.latent_std_floor
+        self.latent_raw_std_clip = args.latent_raw_std_clip
 
         # Shared token embedding
         self.tok_emb = nn.Embedding(args.vocab_size, D)
@@ -512,6 +528,11 @@ class SegmentBottleneckVAE(nn.Module):
             if isinstance(m, nn.Linear) and getattr(m, "_zero_init", False):
                 nn.init.zeros_(m.weight)
 
+    def _stable_logvar(self, raw: Tensor) -> Tensor:
+        raw = raw.clamp(-self.latent_raw_std_clip, self.latent_raw_std_clip)
+        std = F.softplus(raw) + self.latent_std_floor
+        return 2.0 * torch.log(std)
+
     def encode(self, tok_embs: Tensor) -> tuple[Tensor, Tensor]:
         B, T, D = tok_embs.shape
         S = self.segment_size
@@ -522,7 +543,7 @@ class SegmentBottleneckVAE(nn.Module):
             x = blk(x)
         pooled = self.enc_norm(x).mean(dim=1)
         mu = self.mu_proj(pooled).reshape(B, N, -1)
-        logvar = self.logvar_proj(pooled).reshape(B, N, -1).clamp(-10, 10)
+        logvar = self._stable_logvar(self.logvar_proj(pooled).reshape(B, N, -1))
         return mu, logvar
 
     def prior_forward(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -534,7 +555,7 @@ class SegmentBottleneckVAE(nn.Module):
             h = blk(h)
         h = self.prior_norm(h[:, :N])
         mu_p = self.mu_prior_proj(h)
-        logvar_p = self.logvar_prior_proj(h).clamp(-10, 10)
+        logvar_p = self._stable_logvar(self.logvar_prior_proj(h))
         return mu_p, logvar_p, h
 
     def decode(self, cond: Tensor, tok_embs: Tensor, seg_tokens: Tensor) -> Tensor:
@@ -542,6 +563,7 @@ class SegmentBottleneckVAE(nn.Module):
         S = self.segment_size
         N = T // S
 
+        cond = F.rms_norm(cond, (cond.size(-1),))
         all_mems = self.z_to_mem(cond).reshape(B, N, self.n_mem, D)
         prev_mems = torch.cat([
             torch.zeros(B, 1, self.n_mem, D, device=all_mems.device, dtype=all_mems.dtype),
@@ -858,6 +880,8 @@ def main() -> None:
         f"mem={args.n_mem_tokens} segs/seq={n_segs}")
     log(f"  kl: weight={args.kl_weight} free_bits={args.free_bits} "
         f"warmup={args.kl_warmup_steps}")
+    log(f"  opt: embed_lr={args.embed_lr} matrix_lr={args.matrix_lr} "
+        f"latent_lr={args.latent_lr} scalar_lr={args.scalar_lr}")
 
     # Data
     train_loader = TokenLoader(args.train_files, device)
@@ -893,6 +917,7 @@ def main() -> None:
 
     # Optimizer split: Muon for 2D matrix params, Adam for rest
     matrix_params: list[Tensor] = []
+    latent_params: list[Tensor] = []
     scalar_params: list[Tensor] = []
     embed_params = [raw_model.tok_emb.weight]
 
@@ -900,6 +925,9 @@ def main() -> None:
         if p is raw_model.tok_emb.weight:
             continue
         if "lora" in name:
+            continue
+        if any(ln in name for ln in LATENT_NAMES):
+            latent_params.append(p)
             continue
         if p.ndim == 2 and p.numel() > 256 and not any(cn in name for cn in CONTROL_NAMES):
             matrix_params.append(p)
@@ -914,10 +942,13 @@ def main() -> None:
                           backend_steps=args.muon_backend_steps)
     for g in optimizer_muon.param_groups:
         g["base_lr"] = args.matrix_lr
+    optimizer_latent = torch.optim.Adam(
+        [{"params": latent_params, "lr": args.latent_lr, "base_lr": args.latent_lr}],
+        betas=(args.beta1, args.beta2), fused=True)
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2), fused=True)
-    optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers = [optimizer_tok, optimizer_muon, optimizer_latent, optimizer_scalar]
 
     ema = EMA(raw_model, args.ema_decay)
 
