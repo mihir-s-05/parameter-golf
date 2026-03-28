@@ -601,7 +601,7 @@ class SegmentBottleneckVAE(nn.Module):
         return F.cross_entropy(logits.reshape(-1, self.vocab_size),
                                targets.reshape(-1), reduction="mean")
 
-    def forward(self, tokens: Tensor, free_bits: float = 0.0) -> tuple[Tensor, Tensor]:
+    def forward(self, tokens: Tensor, free_bits: float = 0.0) -> tuple[Tensor, Tensor, Tensor]:
         B, T = tokens.shape
         S = self.segment_size
         N = T // S
@@ -622,10 +622,11 @@ class SegmentBottleneckVAE(nn.Module):
         var_q = logvar.exp()
         var_p = logvar_p.exp().clamp_min(1e-8)
         kl_per_dim = 0.5 * (logvar_p - logvar + (var_q + (mu - mu_p).pow(2)) / var_p - 1)
+        kl_true_loss = kl_per_dim.sum(dim=-1).mean() / self.segment_size
         kl_per_dim = torch.clamp(kl_per_dim - free_bits, min=0.0)
         kl_loss = kl_per_dim.sum(dim=-1).mean() / self.segment_size
 
-        return recon_loss, kl_loss
+        return recon_loss, kl_loss, kl_true_loss
 
 # ---------------------------------------------------------------------------
 # QUANTIZATION (int6 GPTQ-lite + lzma)
@@ -795,7 +796,7 @@ def eval_val_ttt(
                 chunk = val_tokens[bs * seq_len : be * seq_len]
                 chunk = chunk.to(device=device, dtype=torch.int64).reshape(be - bs, seq_len)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    recon, kl = model(chunk, free_bits=0.0)
+                    recon, kl, _kl_true = model(chunk, free_bits=0.0)
                 n_tok = chunk.numel()
                 total_recon += recon.item() * n_tok
                 total_kl += kl.item() * n_tok
@@ -821,7 +822,7 @@ def eval_val_ttt(
                     chunk = chunk.to(device=device, dtype=torch.int64).reshape(be - bs, seq_len)
                     optimizer.zero_grad(set_to_none=True)
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        recon, kl = model(chunk, free_bits=0.0)
+                        recon, kl, _kl_true = model(chunk, free_bits=0.0)
                     (recon + kl).backward()
                     torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
                     optimizer.step()
@@ -992,7 +993,7 @@ def main() -> None:
             chunk = chunk.to(device=device, dtype=torch.int64).reshape(ei - si, args.train_seq_len)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                recon, kl = model(chunk, free_bits=0.0)
+                recon, kl, _kl_true = model(chunk, free_bits=0.0)
 
             n_tok = chunk.numel()
             total_recon += recon.item() * n_tok
@@ -1045,7 +1046,7 @@ def main() -> None:
         tokens = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len)
         zero_grad_all()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            recon, kl = model(tokens, free_bits=args.free_bits)
+            recon, kl, kl_true = model(tokens, free_bits=args.free_bits)
         total_loss = recon + kl_w * kl
         total_loss.backward()
         if args.grad_clip_norm > 0:
@@ -1057,7 +1058,7 @@ def main() -> None:
 
         if step % args.train_log_every == 0:
             log(f"step={step:5d} recon={recon.item():.4f} kl={kl.item():.4f} "
-                f"total={total_loss.item():.4f} kl_w={kl_w:.4f} "
+                f"true_kl={kl_true.item():.4f} total={total_loss.item():.4f} kl_w={kl_w:.4f} "
                 f"lr_s={scale:.3f} time={elapsed:.1f}s")
 
         if args.val_loss_every > 0 and step > 0 and step % args.val_loss_every == 0:

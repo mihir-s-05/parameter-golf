@@ -2,12 +2,12 @@
 set -e
 
 echo "=============================================="
-echo "Segment-Bottleneck VAE LM — Single H100 Stability Probe"
+echo "Segment-Bottleneck VAE LM — Single H100"
 echo "=============================================="
 
 pip install -q sentencepiece 2>/dev/null || true
 
-export RUN_ID="sbvae_h100_probe_$(date +%Y%m%d_%H%M%S)"
+export RUN_ID="sbvae_h100_$(date +%Y%m%d_%H%M%S)"
 export DATA_PATH="./data/datasets/fineweb10B_sp1024"
 export TOKENIZER_PATH="./data/tokenizers/fineweb_1024_bpe.model"
 export SEED=1337
@@ -38,7 +38,7 @@ export SEGMENT_SIZE=16
 export LATENT_DIM=384
 export N_MEM_TOKENS=6
 export KL_WEIGHT=1.0
-export FREE_BITS=0.15
+export FREE_BITS=0.03
 export KL_WARMUP_STEPS=8000
 export USE_PRIOR_CONTEXT=1
 export LATENT_STD_FLOOR=1e-4
@@ -47,10 +47,10 @@ export LATENT_RAW_STD_CLIP=8.0
 # Training
 export TRAIN_SEQ_LEN=1024
 export TRAIN_BATCH_TOKENS=65536
-export ITERATIONS=6000
+export ITERATIONS=20000
 export WARMDOWN_ITERS=3000
 export WARMUP_STEPS=200
-export MAX_WALLCLOCK_SECONDS=2400
+export MAX_WALLCLOCK_SECONDS=4800
 
 # Optimizer
 export EMBED_LR=0.03
