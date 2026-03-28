@@ -33,9 +33,9 @@ export PRIOR_DIM=256
 export PRIOR_LAYERS=3
 export PRIOR_HEADS=4
 
-# VAE
-export SEGMENT_SIZE=32
-export LATENT_DIM=192
+# VAE (small segments + large latent for max info flow)
+export SEGMENT_SIZE=16
+export LATENT_DIM=384
 export N_MEM_TOKENS=6
 export KL_WEIGHT=1.0
 export FREE_BITS=0.15

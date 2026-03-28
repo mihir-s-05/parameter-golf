@@ -539,7 +539,13 @@ class SegmentBottleneckVAE(nn.Module):
         S = self.segment_size
         N = T // S
 
-        mem = self.z_to_mem(cond).reshape(B * N, self.n_mem, D)
+        all_mems = self.z_to_mem(cond).reshape(B, N, self.n_mem, D)
+        prev_mems = torch.cat([
+            torch.zeros(B, 1, self.n_mem, D, device=all_mems.device, dtype=all_mems.dtype),
+            all_mems[:, :-1]
+        ], dim=1)
+        mem = torch.cat([prev_mems, all_mems], dim=2).reshape(B * N, 2 * self.n_mem, D)
+
         seg_embs = tok_embs[:, :N * S].reshape(B, N, S, D)
         dec_tok = seg_embs[:, :, :-1].reshape(B * N, S - 1, D)
         x = torch.cat([mem, dec_tok], dim=1)
@@ -561,7 +567,8 @@ class SegmentBottleneckVAE(nn.Module):
                     x = x + self.skip_weights[i].to(x.dtype)[None, None] * skips.pop()
                 x = self.dec_blocks[self.n_enc_layers + i](x, x0)
 
-        h = self.final_norm(x)[:, self.n_mem - 1 :, :]
+        total_mem = 2 * self.n_mem
+        h = self.final_norm(x)[:, total_mem - 1 :, :]
         logits = F.linear(h, self.tok_emb.weight)
         if self.logit_softcap > 0:
             logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
