@@ -39,7 +39,7 @@ export LATENT_DIM=384
 export N_MEM_TOKENS=6
 export KL_WEIGHT=1.0
 export FREE_BITS=0.15
-export KL_WARMUP_STEPS=2000
+export KL_WARMUP_STEPS=4000
 export USE_PRIOR_CONTEXT=1
 
 # Training

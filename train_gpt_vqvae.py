@@ -521,8 +521,9 @@ class SegmentBottleneckVAE(nn.Module):
         for blk in self.enc_blocks:
             x = blk(x)
         pooled = self.enc_norm(x).mean(dim=1)
-        return (self.mu_proj(pooled).reshape(B, N, -1),
-                self.logvar_proj(pooled).reshape(B, N, -1))
+        mu = self.mu_proj(pooled).reshape(B, N, -1)
+        logvar = self.logvar_proj(pooled).reshape(B, N, -1).clamp(-10, 10)
+        return mu, logvar
 
     def prior_forward(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         B, N, _ = z.shape
@@ -532,7 +533,9 @@ class SegmentBottleneckVAE(nn.Module):
         for blk in self.prior_blocks:
             h = blk(h)
         h = self.prior_norm(h[:, :N])
-        return self.mu_prior_proj(h), self.logvar_prior_proj(h), h
+        mu_p = self.mu_prior_proj(h)
+        logvar_p = self.logvar_prior_proj(h).clamp(-10, 10)
+        return mu_p, logvar_p, h
 
     def decode(self, cond: Tensor, tok_embs: Tensor, seg_tokens: Tensor) -> Tensor:
         B, T, D = tok_embs.shape
