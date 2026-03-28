@@ -13,25 +13,25 @@ export TOKENIZER_PATH="./data/tokenizers/fineweb_1024_bpe.model"
 export SEED=1337
 export VOCAB_SIZE=1024
 
-# Decoder (2 unique layers × 4 loops = 8 effective depth)
-export MODEL_DIM=768
-export DEC_LAYERS=2
-export DEC_LOOPS=4
-export DEC_HEADS=12
-export DEC_KV_HEADS=6
+# Decoder (7 unique layers, no weight tying)
+export MODEL_DIM=512
+export DEC_LAYERS=7
+export DEC_LOOPS=1
+export DEC_HEADS=8
+export DEC_KV_HEADS=4
 export DEC_MLP_MULT=3
 export LOGIT_SOFTCAP=30.0
 export QK_GAIN_INIT=1.5
 
 # Encoder (bidirectional)
-export ENC_DIM=384
-export ENC_LAYERS=3
-export ENC_HEADS=6
+export ENC_DIM=256
+export ENC_LAYERS=2
+export ENC_HEADS=4
 
 # Prior (causal over z)
-export PRIOR_DIM=384
+export PRIOR_DIM=256
 export PRIOR_LAYERS=3
-export PRIOR_HEADS=6
+export PRIOR_HEADS=4
 
 # VAE
 export SEGMENT_SIZE=32
@@ -40,6 +40,7 @@ export N_MEM_TOKENS=6
 export KL_WEIGHT=1.0
 export FREE_BITS=0.15
 export KL_WARMUP_STEPS=2000
+export USE_PRIOR_CONTEXT=1
 
 # Training
 export TRAIN_SEQ_LEN=1024
@@ -60,14 +61,17 @@ export GRAD_CLIP_NORM=1.0
 # EMA
 export EMA_DECAY=0.997
 
-# TTT (LoRA-based)
+# QAT (activates at 65% of training, resets EMA)
+export QAT_FRACTION=0.65
+
+# TTT (full-model SGD, momentum 0.95 per top submissions)
 export TTT_ENABLED=1
 export TTT_LR=0.002
 export TTT_EPOCHS=3
 export TTT_CHUNK_TOKENS=32768
-export TTT_MOMENTUM=0.9
+export TTT_MOMENTUM=0.95
 export TTT_GRAD_CLIP=1.0
-export TTT_LORA_RANK=4
+export TTT_LORA_RANK=0
 
 # Logging
 export VAL_LOSS_EVERY=500

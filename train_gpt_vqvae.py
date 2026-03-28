@@ -111,6 +111,9 @@ class Hyperparameters:
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 0))
     use_prior_context = bool(int(os.environ.get("USE_PRIOR_CONTEXT", "1")))
 
+    # QAT (quantization-aware training)
+    qat_fraction = float(os.environ.get("QAT_FRACTION", "0.65"))
+
 CONTROL_NAMES = ("skip_weights", "attn_scale", "mlp_scale", "resid_mix", "q_gain",
                  "enc_pos", "prior_start", "lora", "loop_emb")
 
@@ -248,9 +251,29 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),))
 
 
+def fake_quantize_ste(t: Tensor, clip_range: int = 31) -> Tensor:
+    """Simulate int6 quantization with straight-through estimator."""
+    t32 = t.float()
+    if t32.ndim >= 2:
+        amax = t32.abs().amax(dim=1, keepdim=True)
+    else:
+        amax = t32.abs().amax(keepdim=True)
+    scale = (amax / clip_range).clamp_min(1.0 / clip_range)
+    t_q = torch.clamp(torch.round(t32 / scale), -clip_range, clip_range)
+    t_deq = (t_q * scale).to(t.dtype)
+    return t + (t_deq - t).detach()
+
+
 class CastedLinear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.qat = False
+
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.weight.to(x.dtype),
+        w = self.weight
+        if self.qat and w.numel() > 65_536:
+            w = fake_quantize_ste(w)
+        return F.linear(x, w.to(x.dtype),
                         self.bias.to(x.dtype) if self.bias is not None else None)
 
 
@@ -955,12 +978,22 @@ def main() -> None:
     # Training loop
     log("Training...")
     t0 = time.perf_counter()
+    qat_start_step = int(args.qat_fraction * args.iterations)
+    qat_active = False
 
     for step in range(args.iterations):
         elapsed = time.perf_counter() - t0
         if args.max_wallclock_seconds > 0 and elapsed > args.max_wallclock_seconds:
             log(f"Wallclock limit at step {step}")
             break
+
+        if not qat_active and step >= qat_start_step:
+            qat_active = True
+            for m in raw_model.modules():
+                if isinstance(m, CastedLinear):
+                    m.qat = True
+            ema = EMA(raw_model, args.ema_decay)
+            log(f"QAT activated at step {step}, EMA reset")
 
         scale = lr_scale(step)
         kl_w = kl_weight_at(step)
